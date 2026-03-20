@@ -6,7 +6,6 @@ metadata:
 data:
   init.sql: |
     -- Connect to the database (already created by POSTGRES_DB=dbname)
-    \c dbname;
 
     -- Create tables for auth-service
     CREATE TABLE IF NOT EXISTS users (
