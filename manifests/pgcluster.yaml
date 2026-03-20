@@ -7,6 +7,7 @@ spec:
   instances: 3
   storage:
     size: 1Gi
+    storageClass: gp3
   bootstrap:
     initdb:
       database: dbname
