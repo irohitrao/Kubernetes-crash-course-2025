@@ -13,6 +13,6 @@ spec:
     spec:
       containers:
       - name: frontend
-        image: saiyam911/frontend:final
+        image: 408009925873.dkr.ecr.ap-south-1.amazonaws.com/frontend:v1
         imagePullPolicy: Always
         ports: [{ containerPort: 80 }]

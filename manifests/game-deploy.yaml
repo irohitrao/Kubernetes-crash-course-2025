@@ -13,7 +13,7 @@ spec:
     spec:
       containers:
       - name: game-service
-        image: saiyam911/game-service:final
+        image: 408009925873.dkr.ecr.ap-south-1.amazonaws.com/game-service:v1
         imagePullPolicy: Always
         ports:
         - containerPort: 8081
