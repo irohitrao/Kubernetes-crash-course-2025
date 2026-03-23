@@ -1,4 +1,17 @@
 # manifests/gateway.yaml
+# This Gateway is the entry point for all external traffic to the cluster.
+# It uses kgateway (Solo.io) to automatically provision an AWS LoadBalancer.
+# 
+# Architecture:
+# - cm-acme listener: Used by cert-manager for ACME HTTP-01 challenge validation
+# - http listener: Routes application traffic over HTTP
+# - https listener: Routes application traffic over HTTPS with automatic TLS termination
+#
+# Why sectionName matters:
+# When multiple HTTPRoutes attach to the same Gateway, each must have a unique
+# sectionName to avoid conflicts. cert-manager attaches to "cm-acme" section,
+# while app routes use the default section, preventing collisions.
+
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
@@ -7,23 +20,37 @@ metadata:
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
 spec:
-  gatewayClassName: kgateway
+  gatewayClassName: kgateway  # Use kgateway controller (Solo.io Gateway)
   listeners:
-    - name: http
+    # ACME HTTP-01 Challenge Listener
+    # Dedicated listener for cert-manager ACME challenges and application traffic.
+    # This single HTTP listener handles both ACME challenges and app traffic
+    # for the domain. The hostname ensures it only accepts traffic for this domain.
+    - name: cm-acme
       protocol: HTTP
       port: 80
+      hostname: "k8s2025.rohitmrdevops.online"  # Only for this domain
       allowedRoutes:
         namespaces:
           from: All
+    
+    # Application HTTPS Listener
+    # Terminates TLS for external users. The Gateway uses the TLS Secret
+    # (automatically created by cert-manager) to decrypt incoming HTTPS traffic.
+    # The Secret is referenced by name and auto-populated by cert-manager
+    # whenever a new certificate is issued or renewed.
     - name: https
       protocol: HTTPS
       port: 443
-      hostname: "k8s2025.kubesimplify.com"
+      hostname: "k8s2025.rohitmrdevops.online"  # Only accept traffic for this domain
       tls:
-        mode: Terminate
+        mode: Terminate  # Gateway handles TLS encryption/decryption
         certificateRefs:
+          # This Secret is created by cert-manager automatically.
+          # The ClusterIssuer (letsencrypt-prod) instructs cert-manager to populate
+          # this Secret with the TLS certificate from Let's Encrypt.
           - kind: Secret
-            name: course-kubesimplify-com-tls
+            name: k8s2025.rohitmrdevops.online-tls
       allowedRoutes:
         namespaces:
           from: All

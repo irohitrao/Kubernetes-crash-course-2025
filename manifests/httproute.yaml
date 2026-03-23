@@ -7,8 +7,9 @@ spec:
   parentRefs:
   - name: crash-course-gateway
     namespace: kgateway-system
+    sectionName: https
   hostnames:
-  - "k8s2025.kubesimplify.com"
+  - "k8s2025.rohitmrdevops.online"
   rules:
   - matches:
       - path:

@@ -7,11 +7,15 @@ spec:
   parentRefs:
   - name: crash-course-gateway
     namespace: kgateway-system
-    sectionName: http
+    sectionName: cm-acme
   hostnames:
-  - k8s2025.kubesimplify.com
+  - k8s2025.rohitmrdevops.online
   rules:
-  - filters:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /              # broad match — ACME paths (more specific) win over this
+    filters:
     - type: RequestRedirect
       requestRedirect:
         scheme: https
