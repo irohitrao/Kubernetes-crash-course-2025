@@ -1,0 +1,35 @@
+---
+- name: Check if Prometheus operator is installed
+  shell: |
+    kubectl get crd servicemonitors.monitoring.coreos.com --context={{ k8s_context }} > /dev/null 2>&1
+  register: prometheus_crd
+  failed_when: false
+  changed_when: false
+
+- name: Apply ServiceMonitor if Prometheus is available
+  shell: |
+    kubectl apply -f /tmp/manifests/servicemonitor.yaml \
+      --namespace={{ k8s_namespace }} \
+      --context={{ k8s_context }}
+  when: 
+    - enable_monitoring
+    - prometheus_crd.rc == 0
+  register: servicemonitor_result
+  changed_when: "'created' in servicemonitor_result.stdout or 'configured' in servicemonitor_result.stdout"
+  failed_when: servicemonitor_result.rc != 0
+
+- name: Verify ServiceMonitor acceptance (if enabled)
+  shell: |
+    if [ "{{ enable_monitoring }}" = "true" ] && [ {{ prometheus_crd.rc }} -eq 0 ]; then
+      status=$(kubectl get servicemonitor -n {{ k8s_namespace }} --context={{ k8s_context }} -o jsonpath='{.items[0].status.observedGeneration}')
+      if [ ! -z "$status" ]; then
+        echo "✓ ServiceMonitor created and observed"
+      fi
+    else
+      echo "⚠ Monitoring disabled or Prometheus operator not found"
+    fi
+  register: monitoring_status
+
+- name: Debug: Print monitoring status
+  debug:
+    msg: "{{ monitoring_status.stdout }}"

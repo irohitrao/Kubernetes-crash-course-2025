@@ -13,7 +13,7 @@ spec:
     spec:
       containers:
       - name: auth-service
-        image: 408009925873.dkr.ecr.ap-south-1.amazonaws.com/auth-service:v1
+        image: IMAGE_REGISTRY/auth-service:IMAGE_TAG
         imagePullPolicy: Always
         ports:
         - containerPort: 8080

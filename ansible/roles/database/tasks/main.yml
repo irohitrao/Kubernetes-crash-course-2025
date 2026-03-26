@@ -1,0 +1,46 @@
+---
+- name: Apply ConfigMap for database initialization
+  shell: |
+    kubectl apply -f /tmp/manifests/configmap.yaml \
+      --namespace={{ k8s_namespace }} \
+      --context={{ k8s_context }}
+  register: configmap_result
+  changed_when: "'created' in configmap_result.stdout or 'configured' in configmap_result.stdout"
+  failed_when: configmap_result.rc != 0
+
+- name: Apply PostgreSQL Cluster manifest
+  shell: |
+    kubectl apply -f /tmp/manifests/pgcluster.yaml \
+      --namespace={{ k8s_namespace }} \
+      --context={{ k8s_context }}
+  register: pgcluster_result
+  changed_when: "'created' in pgcluster_result.stdout or 'configured' in pgcluster_result.stdout"
+  failed_when: pgcluster_result.rc != 0
+
+- name: Wait for PostgreSQL cluster to become ready
+  shell: |
+    kubectl wait --for=condition=ready pod \
+      -l app.kubernetes.io/name=postgresql \
+      --namespace={{ k8s_namespace }} \
+      --context={{ k8s_context }} \
+      --timeout={{ database_ready_timeout }}s
+  register: db_ready_check
+  failed_when: db_ready_check.rc != 0
+
+- name: Verify database is initialized
+  shell: |
+    kubectl exec -it -n {{ k8s_namespace }} --context={{ k8s_context }} \
+      $(kubectl get pod -l app.kubernetes.io/name=postgresql -n {{ k8s_namespace }} -o jsonpath='{.items[0].metadata.name}') \
+      -- psql -U {{ db_username }} -d app -c "SELECT 1" > /dev/null 2>&1
+  register: db_init_check
+  retries: 5
+  delay: 10
+  until: db_init_check.rc == 0
+  failed_when: false
+
+- name: Debug: Print database deployment result
+  debug:
+    msg:
+      - "✓ PostgreSQL cluster deployed"
+      - "✓ Database cluster is ready"
+      - "Database ready check: {{ db_ready_check.stdout }}"

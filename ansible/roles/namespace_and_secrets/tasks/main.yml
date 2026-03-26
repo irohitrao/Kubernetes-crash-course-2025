@@ -1,0 +1,26 @@
+---
+- name: Create or verify application namespace
+  shell: |
+    kubectl get namespace {{ k8s_namespace }} --context={{ k8s_context }} > /dev/null 2>&1 || \
+    kubectl create namespace {{ k8s_namespace }} --context={{ k8s_context }}
+  changed_when: false
+
+- name: Create PostgreSQL secret from credentials
+  shell: |
+    kubectl create secret generic {{ db_secret_name }} \
+      --from-literal=username={{ db_username }} \
+      --from-literal=password={{ db_password }} \
+      --namespace={{ k8s_namespace }} \
+      --context={{ k8s_context }} \
+      --dry-run=client -o yaml | kubectl apply -f -
+  changed_when: false
+
+- name: Verify secret was created
+  shell: |
+    kubectl get secret {{ db_secret_name }} --namespace={{ k8s_namespace }} --context={{ k8s_context }}
+  register: secret_verify
+  failed_when: secret_verify.rc != 0
+
+- name: Debug: Print secret creation result
+  debug:
+    msg: "✓ Secret '{{ db_secret_name }}' created/updated in namespace '{{ k8s_namespace }}'"

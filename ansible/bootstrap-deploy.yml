@@ -1,0 +1,49 @@
+---
+# Bootstrap Pipeline Playbook
+# Runs prerequisites, database setup, and initial infrastructure deployment
+# Should be run only during initial cluster setup, not during regular app releases
+
+- hosts: localhost
+  gather_facts: false
+  vars:
+    manifests_dir: "{{ playbook_dir }}/../manifests"
+  pre_tasks:
+    - name: "Print bootstrap deployment info"
+      debug:
+        msg:
+          - "Starting Bootstrap Pipeline for {{ env_name }}"
+          - "Environment: {{ env_name }}"
+          - "Kubernetes Context: {{ k8s_context }}"
+          - "Namespace: {{ k8s_namespace }}"
+          - "Target Domain: {{ app_domain }}"
+
+    - name: "Copy manifests to temp directory"
+      shell: |
+        mkdir -p /tmp/manifests
+        cp {{ manifests_dir }}/*.yaml /tmp/manifests/ 2>/dev/null || true
+      changed_when: false
+
+  roles:
+    - role: prerequisites
+      tags: ["prerequisites"]
+
+    - role: namespace_and_secrets
+      tags: ["secrets"]
+
+    - role: database
+      tags: ["database"]
+
+  post_tasks:
+    - name: "Print bootstrap completion message"
+      debug:
+        msg:
+          - ""
+          - "=== Bootstrap Pipeline Completed Successfully ==="
+          - "✓ Prerequisites validated"
+          - "✓ Namespace and secrets created"
+          - "✓ PostgreSQL cluster deployed and ready"
+          - ""
+          - "Next Steps:"
+          - "1. Verify database initialization: kubectl exec -it <pod> -- psql -U postgres"
+          - "2. Run the application release pipeline when ready"
+          - "3. Verify all workloads are healthy"

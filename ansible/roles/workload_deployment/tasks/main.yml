@@ -1,0 +1,121 @@
+---
+# Force rollout option: Set force_rollout=true to restart pods even if spec hasn't changed
+# Useful when image content changed but tag didn't, or for manual redeploys
+- name: "Set force_rollout default"
+  set_fact:
+    force_rollout: "{{ force_rollout | default(false) }}"
+
+- name: Render and apply auth deployment
+  shell: |
+    cat /tmp/manifests/auth-deploy.yaml | \
+    sed "s|IMAGE_TAG|{{ auth_image }}|g" | \
+    kubectl apply -f - --namespace={{ k8s_namespace }} --context={{ k8s_context }}
+  register: auth_deploy_result
+  changed_when: "'created' in auth_deploy_result.stdout or 'configured' in auth_deploy_result.stdout"
+  failed_when: auth_deploy_result.rc != 0
+
+- name: Force rollout auth deployment if needed
+  shell: |
+    kubectl rollout restart deployment/auth \
+      --namespace={{ k8s_namespace }} \
+      --context={{ k8s_context }}
+  when: force_rollout | bool
+  register: auth_restart_result
+
+- name: Render and apply game deployment
+  shell: |
+    cat /tmp/manifests/game-deploy.yaml | \
+    sed "s|IMAGE_TAG|{{ game_image }}|g" | \
+    kubectl apply -f - --namespace={{ k8s_namespace }} --context={{ k8s_context }}
+  register: game_deploy_result
+  changed_when: "'created' in game_deploy_result.stdout or 'configured' in game_deploy_result.stdout"
+  failed_when: game_deploy_result.rc != 0
+
+- name: Force rollout game deployment if needed
+  shell: |
+    kubectl rollout restart deployment/game \
+      --namespace={{ k8s_namespace }} \
+      --context={{ k8s_context }}
+  when: force_rollout | bool
+  register: game_restart_result
+
+- name: Render and apply frontend deployment
+  shell: |
+    cat /tmp/manifests/frontend.yaml | \
+    sed "s|IMAGE_TAG|{{ frontend_image }}|g" | \
+    kubectl apply -f - --namespace={{ k8s_namespace }} --context={{ k8s_context }}
+  register: frontend_deploy_result
+  changed_when: "'created' in frontend_deploy_result.stdout or 'configured' in frontend_deploy_result.stdout"
+  failed_when: frontend_deploy_result.rc != 0
+
+- name: Force rollout frontend deployment if needed
+  shell: |
+    kubectl rollout restart deployment/frontend \
+      --namespace={{ k8s_namespace }} \
+      --context={{ k8s_context }}
+  when: force_rollout | bool
+  register: frontend_restart_result
+
+- name: Apply auth service
+  shell: |
+    kubectl apply -f /tmp/manifests/auth-service.yaml \
+      --namespace={{ k8s_namespace }} \
+      --context={{ k8s_context }}
+  register: auth_svc_result
+  failed_when: auth_svc_result.rc != 0
+
+- name: Apply game service
+  shell: |
+    kubectl apply -f /tmp/manifests/game-service.yaml \
+      --namespace={{ k8s_namespace }} \
+      --context={{ k8s_context }}
+  register: game_svc_result
+  failed_when: game_svc_result.rc != 0
+
+- name: Apply frontend service
+  shell: |
+    kubectl apply -f /tmp/manifests/frontend-service.yaml \
+      --namespace={{ k8s_namespace }} \
+      --context={{ k8s_context }}
+  register: frontend_svc_result
+  failed_when: frontend_svc_result.rc != 0
+
+- name: Wait for auth deployment to be ready
+  shell: |
+    kubectl rollout status deployment/auth \
+      --namespace={{ k8s_namespace }} \
+      --context={{ k8s_context }} \
+      --timeout={{ workload_ready_timeout }}s
+  failed_when: false
+
+- name: Wait for game deployment to be ready
+  shell: |
+    kubectl rollout status deployment/game \
+      --namespace={{ k8s_namespace }} \
+      --context={{ k8s_context }} \
+      --timeout={{ workload_ready_timeout }}s
+  failed_when: false
+
+- name: Wait for frontend deployment to be ready
+  shell: |
+    kubectl rollout status deployment/frontend \
+      --namespace={{ k8s_namespace }} \
+      --context={{ k8s_context }} \
+      --timeout={{ workload_ready_timeout }}s
+  failed_when: false
+
+- name: Verify services have endpoints
+  shell: |
+    for svc in auth game frontend; do
+      endpoints=$(kubectl get endpoints $svc --namespace={{ k8s_namespace }} --context={{ k8s_context }} -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null | wc -w)
+      if [ "$endpoints" -eq 0 ]; then
+        echo "⚠ Service $svc has no endpoints"
+      else
+        echo "✓ Service $svc has $endpoints endpoints"
+      fi
+    done
+  register: endpoints_check
+
+- name: Debug: Print endpoints verification results
+  debug:
+    msg: "{{ endpoints_check.stdout_lines }}"

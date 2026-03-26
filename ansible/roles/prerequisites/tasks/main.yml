@@ -1,0 +1,108 @@
+---
+- name: Check kubectl access
+  shell: |
+    kubectl cluster-info --context={{ k8s_context }} > /dev/null 2>&1
+  register: kubectl_check
+  failed_when: false
+  changed_when: false
+
+- name: Verify kubectl access
+  assert:
+    that:
+      - kubectl_check.rc == 0
+    fail_msg: "Unable to access Kubernetes cluster with context {{ k8s_context }}"
+
+- name: Check AWS authentication
+  shell: |
+    aws sts get-caller-identity > /dev/null 2>&1
+  register: aws_auth_check
+  failed_when: false
+  changed_when: false
+
+- name: Verify AWS authentication
+  assert:
+    that:
+      - aws_auth_check.rc == 0
+    fail_msg: "AWS authentication failed"
+
+- name: Check ECR access
+  shell: |
+    aws ecr describe-repositories --repository-names frontend --region {{ aws_region }} > /dev/null 2>&1
+  register: ecr_check
+  failed_when: false
+  changed_when: false
+
+- name: Verify ECR repositories exist
+  assert:
+    that:
+      - ecr_check.rc == 0
+    fail_msg: "Unable to access ECR repositories"
+
+- name: Check if cert-manager CRD exists
+  shell: |
+    kubectl get crd certificates.cert-manager.io --context={{ k8s_context }} > /dev/null 2>&1
+  register: certmanager_crd
+  failed_when: false
+  changed_when: false
+
+- name: Verify cert-manager is installed
+  assert:
+    that:
+      - certmanager_crd.rc == 0
+    fail_msg: "cert-manager CRD not found. Ensure cert-manager is installed on the cluster."
+
+- name: Check if CloudNativePG CRD exists
+  shell: |
+    kubectl get crd clusters.postgresql.cnpg.io --context={{ k8s_context }} > /dev/null 2>&1
+  register: cnpg_crd
+  failed_when: false
+  changed_when: false
+
+- name: Verify CloudNativePG is installed
+  assert:
+    that:
+      - cnpg_crd.rc == 0
+    fail_msg: "CloudNativePG CRD not found. Ensure CloudNativePG operator is installed on the cluster."
+
+- name: Check if Gateway CRDs exist
+  shell: |
+    kubectl get crd gateways.gateway.networking.k8s.io --context={{ k8s_context }} > /dev/null 2>&1
+  register: gateway_crd
+  failed_when: false
+  changed_when: false
+
+- name: Verify Gateway API is installed
+  assert:
+    that:
+      - gateway_crd.rc == 0
+    fail_msg: "Gateway API CRDs not found. Ensure Gateway API or kgateway is installed on the cluster."
+
+- name: Check if target namespace exists
+  shell: |
+    kubectl get namespace {{ k8s_namespace }} --context={{ k8s_context }} > /dev/null 2>&1
+  register: namespace_check
+  failed_when: false
+  changed_when: false
+
+- name: Create namespace if it doesn't exist
+  shell: |
+    kubectl create namespace {{ k8s_namespace }} --context={{ k8s_context }}
+  when: namespace_check.rc != 0
+
+- name: Verify namespace was created
+  shell: |
+    kubectl get namespace {{ k8s_namespace }} --context={{ k8s_context }} > /dev/null 2>&1
+  register: namespace_verify
+  failed_when: false
+  changed_when: false
+
+- name: Debug: Print prerequisites validation results
+  debug:
+    msg:
+      - "✓ kubectl access verified"
+      - "✓ AWS authentication verified"
+      - "✓ ECR access verified"
+      - "✓ cert-manager installed"
+      - "✓ CloudNativePG operator installed"
+      - "✓ Gateway API installed"
+      - "✓ Namespace '{{ k8s_namespace }}' is ready"

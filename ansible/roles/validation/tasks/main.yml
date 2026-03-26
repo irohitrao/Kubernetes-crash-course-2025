@@ -1,0 +1,71 @@
+---
+- name: Validate workload deployments
+  shell: |
+    for deployment in auth game frontend; do
+      ready=$(kubectl get deployment $deployment --namespace={{ k8s_namespace }} --context={{ k8s_context }} -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null)
+      if [ "$ready" = "True" ]; then
+        echo "✓ Deployment $deployment is ready"
+      else
+        echo "✗ Deployment $deployment is not ready"
+        exit 1
+      fi
+    done
+  register: workload_validation
+
+- name: Validate service endpoints
+  shell: |
+    for svc in auth game frontend; do
+      endpoints=$(kubectl get endpoints $svc --namespace={{ k8s_namespace }} --context={{ k8s_context }} -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null | wc -w)
+      if [ "$endpoints" -gt 0 ]; then
+        echo "✓ Service $svc has endpoints"
+      else
+        echo "✗ Service $svc has no endpoints"
+        exit 1
+      fi
+    done
+  register: endpoint_validation
+
+- name: Validate gateway status
+  shell: |
+    programmed=$(kubectl get gateway -n {{ k8s_namespace }} --context={{ k8s_context }} -o jsonpath='{.items[0].status.conditions[?(@.type=="Programmed")].status}')
+    if [ "$programmed" = "True" ]; then
+      echo "✓ Gateway is programmed"
+    else
+      echo "✗ Gateway is not programmed"
+      exit 1
+    fi
+  register: gateway_validation
+
+- name: Validate route acceptance
+  shell: |
+    accepted=$(kubectl get httproute -n {{ k8s_namespace }} --context={{ k8s_context }} -o jsonpath='{.items[0].status.parents[0].conditions[?(@.type=="Accepted")].status}')
+    if [ "$accepted" = "True" ]; then
+      echo "✓ HTTPRoute is accepted"
+    else
+      echo "✗ HTTPRoute is not accepted"
+      exit 1
+    fi
+  register: route_validation
+
+- name: Validate TLS certificate (if enabled)
+  shell: |
+    if [ "{{ enable_tls }}" = "true" ]; then
+      cert_ready=$(kubectl get certificate -n {{ k8s_namespace }} --context={{ k8s_context }} -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}')
+      if [ "$cert_ready" = "True" ]; then
+        echo "✓ Certificate is ready"
+      else
+        echo "⚠ Certificate not yet ready (may be in progress)"
+      fi
+    fi
+  register: tls_validation
+  failed_when: false
+
+- name: Print validation summary
+  debug:
+    msg:
+      - "=== Deployment Validation Summary ==="
+      - "{{ workload_validation.stdout_lines }}"
+      - "{{ endpoint_validation.stdout_lines }}"
+      - "{{ gateway_validation.stdout_lines }}"
+      - "{{ route_validation.stdout_lines }}"
+      - "{{ tls_validation.stdout_lines }}"

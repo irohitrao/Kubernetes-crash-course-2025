@@ -13,7 +13,7 @@ spec:
     spec:
       containers:
       - name: game-service
-        image: 408009925873.dkr.ecr.ap-south-1.amazonaws.com/game-service:v1
+        image: IMAGE_REGISTRY/game-service:IMAGE_TAG
         imagePullPolicy: Always
         ports:
         - containerPort: 8081

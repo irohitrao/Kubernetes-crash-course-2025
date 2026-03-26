@@ -1,0 +1,339 @@
+@Library('shared-pipeline-library') _
+
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'stage', 'prod'],
+            description: 'Target deployment environment'
+        )
+        string(
+            name: 'IMAGE_TAG',
+            defaultValue: '',
+            description: 'Image tag to deploy (commit SHA or version tag)'
+        )
+        booleanParam(
+            name: 'SKIP_BUILD',
+            defaultValue: false,
+            description: 'Skip image build and use existing images'
+        )
+        booleanParam(
+            name: 'SKIP_DATABASE',
+            defaultValue: true,
+            description: 'Skip database deployment (use existing cluster)'
+        )
+        booleanParam(
+            name: 'RUN_BOOTSTRAP',
+            defaultValue: false,
+            description: 'Run cluster bootstrap pipeline (use with caution)'
+        )
+        booleanParam(
+            name: 'FORCE_ROLLOUT',
+            defaultValue: false,
+            description: 'Force pod restart even if spec unchanged (kubectl rollout restart)'
+        )
+    }
+
+    environment {
+        AWS_REGION = 'us-east-1'
+        AWS_CREDENTIALS = credentials('aws-jenkins-credentials')
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ANSIBLE_INVENTORY = "${WORKSPACE}/ansible/inventory.ini"
+        MANIFESTS_DIR = "${WORKSPACE}/manifests"
+        KUBECONFIG = credentials('kubeconfig-${ENVIRONMENT}')
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        disableConcurrentBuilds()
+        timeout(time: 1, unit: 'HOURS')
+        timestamps()
+    }
+
+    stages {
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    echo "========================================="
+                    echo "Pipeline Configuration"
+                    echo "========================================="
+                    echo "Environment: ${ENVIRONMENT}"
+                    echo "Image Tag: ${IMAGE_TAG ?: 'BUILD FROM SOURCE'}"
+                    echo "Skip Build: ${SKIP_BUILD}"
+                    echo "Skip Database: ${SKIP_DATABASE}"
+                    echo "Run Bootstrap: ${RUN_BOOTSTRAP}"
+                    echo "========================================="
+
+                    if (!SKIP_BUILD && !IMAGE_TAG) {
+                        IMAGE_TAG = sh(
+                            script: 'git rev-parse --short HEAD',
+                            returnStdout: true
+                        ).trim()
+                        echo "Generated image tag from commit SHA: ${IMAGE_TAG}"
+                    }
+
+                    if (ENVIRONMENT == 'prod' && !RUN_BOOTSTRAP) {
+                        input(message: 'Deploy to PRODUCTION? This requires approval.', ok: 'Deploy')
+                    }
+                }
+            }
+        }
+
+        stage('Checkout Source') {
+            when {
+                expression { !SKIP_BUILD }
+            }
+            steps {
+                script {
+                    echo "Checking out application source code..."
+                    checkout scm
+                }
+            }
+        }
+
+        stage('Build Images') {
+            when {
+                expression { !SKIP_BUILD }
+            }
+            steps {
+                script {
+                    echo "========================================="
+                    echo "Building Docker Images"
+                    echo "========================================="
+
+                    // Build frontend image
+                    echo "Building frontend image..."
+                    sh '''
+                        cd ${WORKSPACE}/frontend
+                        docker build -t ${ECR_REGISTRY}/frontend:${IMAGE_TAG} .
+                        docker tag ${ECR_REGISTRY}/frontend:${IMAGE_TAG} ${ECR_REGISTRY}/frontend:latest
+                    '''
+
+                    // Build auth service image
+                    echo "Building auth service image..."
+                    sh '''
+                        cd ${WORKSPACE}/auth-service
+                        docker build -t ${ECR_REGISTRY}/auth:${IMAGE_TAG} .
+                        docker tag ${ECR_REGISTRY}/auth:${IMAGE_TAG} ${ECR_REGISTRY}/auth:latest
+                    '''
+
+                    // Build game service image
+                    echo "Building game service image..."
+                    sh '''
+                        cd ${WORKSPACE}/game-service
+                        docker build -t ${ECR_REGISTRY}/game:${IMAGE_TAG} .
+                        docker tag ${ECR_REGISTRY}/game:${IMAGE_TAG} ${ECR_REGISTRY}/game:latest
+                    '''
+
+                    echo "✓ All images built successfully"
+                }
+            }
+        }
+
+        stage('Authenticate AWS') {
+            steps {
+                script {
+                    echo "Authenticating with AWS..."
+                    sh '''
+                        aws configure set region ${AWS_REGION}
+                        aws sts get-caller-identity
+                    '''
+                }
+            }
+        }
+
+        stage('Push Images to ECR') {
+            when {
+                expression { !SKIP_BUILD }
+            }
+            steps {
+                script {
+                    echo "========================================="
+                    echo "Pushing Images to ECR"
+                    echo "========================================="
+
+                    sh '''
+                        # Login to ECR
+                        aws ecr get-login-password --region ${AWS_REGION} | \
+                        docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+                        # Push frontend
+                        echo "Pushing frontend:${IMAGE_TAG}..."
+                        docker push ${ECR_REGISTRY}/frontend:${IMAGE_TAG}
+                        docker push ${ECR_REGISTRY}/frontend:latest
+
+                        # Push auth
+                        echo "Pushing auth:${IMAGE_TAG}..."
+                        docker push ${ECR_REGISTRY}/auth:${IMAGE_TAG}
+                        docker push ${ECR_REGISTRY}/auth:latest
+
+                        # Push game
+                        echo "Pushing game:${IMAGE_TAG}..."
+                        docker push ${ECR_REGISTRY}/game:${IMAGE_TAG}
+                        docker push ${ECR_REGISTRY}/game:latest
+
+                        echo "✓ All images pushed to ECR"
+                    '''
+                }
+            }
+        }
+
+        stage('Run Bootstrap Pipeline') {
+            when {
+                expression { RUN_BOOTSTRAP }
+            }
+            steps {
+                script {
+                    echo "========================================="
+                    echo "Running Cluster Bootstrap Pipeline"
+                    echo "========================================="
+
+                    sh '''
+                        cd ${WORKSPACE}
+                        ansible-playbook -i ${ANSIBLE_INVENTORY} ansible/bootstrap-deploy.yml \
+                            -e "env_name=${ENVIRONMENT}" \
+                            -e "frontend_image_tag=${IMAGE_TAG}" \
+                            -e "auth_image_tag=${IMAGE_TAG}" \
+                            -e "game_image_tag=${IMAGE_TAG}" \
+                            -v
+                    '''
+                }
+            }
+        }
+
+        stage('Run Application Deployment') {
+            steps {
+                script {
+                    echo "========================================="
+                    echo "Running Application Release Pipeline"
+                    echo "========================================="
+
+                    sh '''
+                        cd ${WORKSPACE}
+                        ansible-playbook -i ${ANSIBLE_INVENTORY} ansible/app-deploy.yml \
+                            -e "env_name=${ENVIRONMENT}" \
+                            -e "frontend_image_tag=${IMAGE_TAG}" \
+                            -e "auth_image_tag=${IMAGE_TAG}" \
+                            -e "game_image_tag=${IMAGE_TAG}" \
+                            -e "force_rollout=${FORCE_ROLLOUT}" \
+                            --skip-tags="database" \
+                            -v
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                script {
+                    echo "========================================="
+                    echo "Verifying Deployment"
+                    echo "========================================="
+
+                    sh '''
+                        source ansible/group_vars/${ENVIRONMENT}.yml
+                        
+                        # Verify all deployments are ready
+                        echo "Checking deployment readiness..."
+                        for deployment in auth game frontend; do
+                            status=$(kubectl get deployment $deployment -n $k8s_namespace -o jsonpath='{.status.conditions[?(@.type=="Available")].status}')
+                            if [ "$status" = "True" ]; then
+                                echo "✓ $deployment deployment is ready"
+                            else
+                                echo "✗ $deployment deployment is NOT ready"
+                                exit 1
+                            fi
+                        done
+
+                        # Get gateway address
+                        echo ""
+                        echo "Retrieving gateway information..."
+                        gateway_addr=$(kubectl get gateway -n $k8s_namespace -o jsonpath='{.items[0].status.addresses[0].value}' 2>/dev/null || echo "pending")
+                        echo "Gateway Address: $gateway_addr"
+                        echo "Application Domain: $app_domain"
+                    '''
+                }
+            }
+        }
+
+        stage('Archive Artifacts') {
+            steps {
+                script {
+                    echo "Archiving deployment artifacts..."
+                    sh '''
+                        mkdir -p ${WORKSPACE}/deployment-artifacts/${BUILD_NUMBER}
+                        
+                        # Archive rendered manifests
+                        cp ${MANIFESTS_DIR}/*.yaml ${WORKSPACE}/deployment-artifacts/${BUILD_NUMBER}/ 2>/dev/null || true
+                        
+                        # Save deployment metadata
+                        cat > ${WORKSPACE}/deployment-artifacts/${BUILD_NUMBER}/metadata.txt << EOF
+Deployment Metadata
+===================
+Build Number: ${BUILD_NUMBER}
+Environment: ${ENVIRONMENT}
+Image Tag: ${IMAGE_TAG}
+Timestamp: $(date)
+Jenkins Job: ${JOB_NAME}
+Git Commit: $(git rev-parse HEAD)
+Git Branch: $(git rev-parse --abbrev-ref HEAD)
+EOF
+                    '''
+                    
+                    archiveArtifacts(
+                        artifacts: "deployment-artifacts/${BUILD_NUMBER}/**",
+                        allowEmptyArchive: true
+                    )
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Pipeline execution completed"
+            // Clean up workspace if needed
+            cleanWs(deleteDirs: true, patterns: [[pattern: '**/tmp/**', type: 'INCLUDE']])
+        }
+
+        success {
+            echo "========================================="
+            echo "✓ DEPLOYMENT SUCCESSFUL"
+            echo "========================================="
+            emailext(
+                subject: "✓ Deployment Successful: ${JOB_NAME} #${BUILD_NUMBER}",
+                body: '''
+                    Environment: ${ENVIRONMENT}
+                    Image Tag: ${IMAGE_TAG}
+                    Status: SUCCESS
+                    
+                    Build URL: ${BUILD_URL}
+                    Logs: ${BUILD_URL}console
+                ''',
+                to: '${DEFAULT_RECIPIENTS}'
+            )
+        }
+
+        failure {
+            echo "========================================="
+            echo "✗ DEPLOYMENT FAILED"
+            echo "========================================="
+            emailext(
+                subject: "✗ Deployment Failed: ${JOB_NAME} #${BUILD_NUMBER}",
+                body: '''
+                    Environment: ${ENVIRONMENT}
+                    Image Tag: ${IMAGE_TAG}
+                    Status: FAILURE
+                    
+                    Build URL: ${BUILD_URL}
+                    Logs: ${BUILD_URL}console
+                    
+                    Please check logs for details.
+                ''',
+                to: '${DEFAULT_RECIPIENTS}'
+            )
+        }
+    }
+}

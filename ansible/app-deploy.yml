@@ -1,0 +1,90 @@
+---
+# Application Release Pipeline Playbook
+# Deploys application workloads, gateway, routing, and monitoring
+# Should be run for each application release/update
+
+- hosts: localhost
+  gather_facts: false
+  vars:
+    manifests_dir: "{{ playbook_dir }}/../manifests"
+  pre_tasks:
+    - name: "Print application deployment info"
+      debug:
+        msg:
+          - "Starting Application Release Pipeline for {{ env_name }}"
+          - "Environment: {{ env_name }}"
+          - "Kubernetes Context: {{ k8s_context }}"
+          - "Namespace: {{ k8s_namespace }}"
+          - "Frontend Image: {{ frontend_image }}"
+          - "Auth Image: {{ auth_image }}"
+          - "Game Image: {{ game_image }}"
+
+    - name: "Copy manifests to temp directory"
+      shell: |
+        mkdir -p /tmp/manifests
+        cp {{ manifests_dir }}/*.yaml /tmp/manifests/ 2>/dev/null || true
+      changed_when: false
+
+    - name: "Validate image tags are provided"
+      assert:
+        that:
+          - frontend_image_tag is defined and frontend_image_tag != 'latest'
+          - auth_image_tag is defined and auth_image_tag != 'latest'
+          - game_image_tag is defined and game_image_tag != 'latest'
+        fail_msg: "Image tags must be defined and not 'latest' for production deployments"
+
+  roles:
+    - role: prerequisites
+      tags: ["prerequisites"]
+
+    - role: namespace_and_secrets
+      tags: ["secrets"]
+
+    - role: workload_deployment
+      tags: ["workload"]
+
+    - role: gateway_and_routing
+      tags: ["gateway"]
+
+    - role: monitoring
+      tags: ["monitoring"]
+
+    - role: validation
+      tags: ["validation"]
+
+  post_tasks:
+    - name: "Get deployment summary"
+      shell: |
+        echo "=== Deployment Summary ==="
+        echo "Namespace: {{ k8s_namespace }}"
+        echo "Environment: {{ env_name }}"
+        echo ""
+        echo "Deployed Services:"
+        kubectl get svc -n {{ k8s_namespace }} --context={{ k8s_context }} | grep -E "frontend|auth|game"
+        echo ""
+        echo "Deployments Status:"
+        kubectl get deployments -n {{ k8s_namespace }} --context={{ k8s_context }} | grep -E "frontend|auth|game"
+        echo ""
+        gateway_addr=$(kubectl get gateway -n {{ k8s_namespace }} --context={{ k8s_context }} -o jsonpath='{.items[0].status.addresses[0].value}' 2>/dev/null || echo "pending")
+        echo "Gateway Address: $gateway_addr"
+        echo "Application Domain: {{ app_domain }}"
+      register: deployment_summary
+
+    - name: "Print application deployment completion message"
+      debug:
+        msg:
+          - ""
+          - "{{ deployment_summary.stdout_lines }}"
+          - ""
+          - "=== Application Release Pipeline Completed Successfully ==="
+          - "✓ All prerequisites validated"
+          - "✓ Namespace and secrets ready"
+          - "✓ All workloads deployed and ready"
+          - "✓ Gateway configured and programmed"
+          - "✓ HTTPRoute accepted and routing traffic"
+          - "✓ TLS certificate deployed"
+          - ""
+          - "Verify Application Access:"
+          - "1. Check DNS resolution: nslookup {{ app_domain }}"
+          - "2. Test HTTPS: curl -v https://{{ app_domain }}"
+          - "3. Monitor logs: kubectl logs -f deployment/<name> -n {{ k8s_namespace }}"

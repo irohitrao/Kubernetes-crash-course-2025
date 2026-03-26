@@ -1,0 +1,62 @@
+---
+# Rollback Playbook
+# Redeploys previous image versions in case of deployment issues
+
+- hosts: localhost
+  gather_facts: false
+  vars:
+    manifests_dir: "{{ playbook_dir }}/../manifests"
+  pre_tasks:
+    - name: "Print rollback info"
+      debug:
+        msg:
+          - "Starting Rollback to Previous Image Versions"
+          - "Environment: {{ env_name }}"
+          - "Kubernetes Context: {{ k8s_context }}"
+          - ""
+          - "PREVIOUS IMAGE TAGS:"
+          - "Frontend: {{ previous_frontend_image_tag | default('N/A') }}"
+          - "Auth: {{ previous_auth_image_tag | default('N/A') }}"
+          - "Game: {{ previous_game_image_tag | default('N/A') }}"
+
+    - name: "Validate previous image tags are provided"
+      assert:
+        that:
+          - previous_frontend_image_tag is defined
+          - previous_auth_image_tag is defined
+          - previous_game_image_tag is defined
+        fail_msg: "Previous image tags must be provided for rollback"
+
+    - name: "Copy manifests to temp directory"
+      shell: |
+        mkdir -p /tmp/manifests
+        cp {{ manifests_dir }}/*.yaml /tmp/manifests/ 2>/dev/null || true
+      changed_when: false
+
+  roles:
+    - role: prerequisites
+      tags: ["prerequisites"]
+
+    - role: workload_deployment
+      vars:
+        frontend_image_tag: "{{ previous_frontend_image_tag }}"
+        auth_image_tag: "{{ previous_auth_image_tag }}"
+        game_image_tag: "{{ previous_game_image_tag }}"
+      tags: ["workload"]
+
+    - role: validation
+      tags: ["validation"]
+
+  post_tasks:
+    - name: "Print rollback completion message"
+      debug:
+        msg:
+          - ""
+          - "=== Rollback Completed Successfully ==="
+          - "✓ Workloads redeployed with previous image tags"
+          - "✓ All deployments validated and ready"
+          - ""
+          - "Rolled back to:"
+          - "- Frontend: {{ previous_frontend_image_tag }}"
+          - "- Auth: {{ previous_auth_image_tag }}"
+          - "- Game: {{ previous_game_image_tag }}"

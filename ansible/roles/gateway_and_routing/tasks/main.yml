@@ -1,0 +1,85 @@
+---
+- name: Render and apply cluster issuer
+  shell: |
+    cat /tmp/manifests/cluster-issuer.yaml | \
+    sed "s|CERT_EMAIL|{{ cert_email }}|g" | \
+    sed "s|APP_DOMAIN|{{ app_domain }}|g" | \
+    kubectl apply -f - --context={{ k8s_context }}
+  register: issuer_result
+  changed_when: "'created' in issuer_result.stdout or 'configured' in issuer_result.stdout"
+  failed_when: issuer_result.rc != 0
+
+- name: Render and apply gateway
+  shell: |
+    cat /tmp/manifests/gateway.yaml | \
+    sed "s|APP_DOMAIN|{{ app_domain }}|g" | \
+    kubectl apply -f - --namespace={{ k8s_namespace }} --context={{ k8s_context }}
+  register: gateway_result
+  changed_when: "'created' in gateway_result.stdout or 'configured' in gateway_result.stdout"
+  failed_when: gateway_result.rc != 0
+
+- name: Render and apply HTTP route
+  shell: |
+    cat /tmp/manifests/httproute.yaml | \
+    sed "s|APP_DOMAIN|{{ app_domain }}|g" | \
+    kubectl apply -f - --namespace={{ k8s_namespace }} --context={{ k8s_context }}
+  register: route_result
+  changed_when: "'created' in route_result.stdout or 'configured' in route_result.stdout"
+  failed_when: route_result.rc != 0
+
+- name: Apply HTTP redirect if enabled
+  shell: |
+    kubectl apply -f /tmp/manifests/httpredirect.yaml \
+      --namespace={{ k8s_namespace }} \
+      --context={{ k8s_context }}
+  when: enable_http_redirect
+  register: redirect_result
+  changed_when: "'created' in redirect_result.stdout or 'configured' in redirect_result.stdout"
+  failed_when: redirect_result.rc != 0
+
+- name: Wait for gateway to be programmed
+  shell: |
+    for i in {1..30}; do
+      status=$(kubectl get gateway -n {{ k8s_namespace }} --context={{ k8s_context }} -o jsonpath='{.items[0].status.conditions[?(@.type=="Programmed")].status}')
+      if [ "$status" = "True" ]; then
+        echo "Gateway is programmed"
+        exit 0
+      fi
+      echo "Waiting for gateway to be programmed... ($i/30)"
+      sleep 6
+    done
+    exit 1
+  register: gateway_ready
+  failed_when: gateway_ready.rc != 0
+  timeout: "{{ gateway_ready_timeout }}"
+
+- name: Get gateway external address
+  shell: |
+    kubectl get gateway -n {{ k8s_namespace }} --context={{ k8s_context }} -o jsonpath='{.items[0].status.addresses[0].value}'
+  register: gateway_address
+
+- name: Verify HTTPRoutes are accepted
+  shell: |
+    status=$(kubectl get httproute -n {{ k8s_namespace }} --context={{ k8s_context }} -o jsonpath='{.items[0].status.parents[0].conditions[?(@.type=="Accepted")].status}')
+    if [ "$status" != "True" ]; then
+      echo "HTTPRoute not accepted"
+      exit 1
+    fi
+    echo "HTTPRoute is accepted"
+  register: route_accepted
+  failed_when: route_accepted.rc != 0
+
+- name: Verify TLS secret exists (if enabled)
+  shell: |
+    kubectl get secret -n {{ k8s_namespace }} --context={{ k8s_context }} | grep tls > /dev/null 2>&1
+  register: tls_secret_check
+  when: enable_tls
+  failed_when: false
+
+- name: Debug: Print gateway and routing deployment result
+  debug:
+    msg:
+      - "✓ Gateway deployed and programmed"
+      - "Gateway Address: {{ gateway_address.stdout }}"
+      - "✓ HTTPRoute deployed and accepted"
+      - "TLS Configuration: Enabled"

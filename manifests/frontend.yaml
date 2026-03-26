@@ -13,6 +13,6 @@ spec:
     spec:
       containers:
       - name: frontend
-        image: 408009925873.dkr.ecr.ap-south-1.amazonaws.com/frontend:v1
+        image: IMAGE_REGISTRY/frontend:IMAGE_TAG
         imagePullPolicy: Always
         ports: [{ containerPort: 80 }]

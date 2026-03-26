@@ -1,0 +1,38 @@
+---
+# Production Environment Configuration
+env_name: prod
+aws_region: us-east-1
+aws_account_id: "{{ prod_aws_account_id | default('123456789012') }}"
+ecr_repository_url: "{{ aws_account_id }}.dkr.ecr.{{ aws_region }}.amazonaws.com"
+
+# Kubernetes Configuration
+k8s_namespace: app
+k8s_context: prod-eks
+
+# Application Configuration
+app_domain: app.example.com
+cert_email: admin@example.com
+
+# Image Configuration
+frontend_image_tag: "{{ frontend_image_tag | default('latest') }}"
+auth_image_tag: "{{ auth_image_tag | default('latest') }}"
+game_image_tag: "{{ game_image_tag | default('latest') }}"
+
+frontend_image: "{{ ecr_repository_url }}/frontend:{{ frontend_image_tag }}"
+auth_image: "{{ ecr_repository_url }}/auth:{{ auth_image_tag }}"
+game_image: "{{ ecr_repository_url }}/game:{{ game_image_tag }}"
+
+# Database Configuration
+db_secret_name: postgres-app
+db_username: postgres
+db_password: "{{ prod_db_password | default('prod-password') }}"
+
+# Feature Flags
+enable_monitoring: true
+enable_tls: true
+enable_http_redirect: true
+
+# Timeouts
+workload_ready_timeout: 600
+database_ready_timeout: 300
+gateway_ready_timeout: 300

@@ -22,6 +22,27 @@ yarn-error.log*
 .env.development.local
 .env.test.local
 .env.production.local
+.env.prod
+.env.stage
+.env.dev
+
+# Ansible Vault secrets (encrypted files should be encrypted, not ignored completely)
+ansible/group_vars/vault-secrets/
+*.vault
+.vault-pass
+
+# Jenkins secrets and artifacts
+.jenkins/
+credentials.xml
+jenkins/credentials/
+jenkins/secrets/
+deployment-artifacts/
+jenkins-artifacts/
+
+# Kubeconfig files
+kubeconfig
+kubeconfig-*
+.kube/
 
 # IDE files
 .vscode/
