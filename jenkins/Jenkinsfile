@@ -12,7 +12,11 @@ pipeline {
         string(
             name: 'IMAGE_TAG',
             defaultValue: '',
-            description: 'Image tag to deploy (commit SHA or version tag)'
+            description: '''Image tag to deploy. Leave EMPTY for auto-generation.
+            For manual tag, must be in ECR. Examples:
+            • auto-generated: abc1234d, 1.2.0-rc42, v1.2.0 (leave empty, don't guess)
+            • manual set: Use EXACT tag from Jenkins output + SKIP_BUILD=true to reuse existing
+            • Rollback: 1.2.0-rc42 with SKIP_BUILD=true (uses tested RC from ECR)'''
         )
         booleanParam(
             name: 'SKIP_BUILD',
@@ -52,6 +56,27 @@ pipeline {
         timestamps()
     }
 
+    triggers {
+        // Auto-trigger on feature branch pushes (develop with dev environment)
+        GenericTrigger(
+            genericVariables: [
+                [key: 'ref', value: '$.ref'],
+                [key: 'repository', value: '$.repository.name']
+            ],
+            causeString: 'Triggered by Git webhook',
+            token: 'kubernetes-deploy-webhook',
+            printContributedVariables: true,
+            printPostContent: true,
+            silentOutput: false,
+            silentStartTrigger: false,
+            shouldNotFlattenMultipleArrays: false,
+            regexpFilterText: '$ref',
+            regexpFilterExpression: '^(refs/heads/develop|refs/heads/feature/.*)$',
+            genericRequestVariables: [],
+            genericHeaderVariables: []
+        )
+    }
+
     stages {
         stage('Validate Parameters') {
             steps {
@@ -59,19 +84,155 @@ pipeline {
                     echo "========================================="
                     echo "Pipeline Configuration"
                     echo "========================================="
+
+                    // Auto-detect branch and set ENVIRONMENT if triggered via webhook
+                    def currentBranch = sh(
+                        script: 'git rev-parse --abbrev-ref HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    if (!params.ENVIRONMENT || params.ENVIRONMENT == 'dev') {
+                        // Auto-set environment based on branch for webhook triggers
+                        if (currentBranch == 'main') {
+                            ENVIRONMENT = 'prod'
+                            echo "ℹ Main branch detected → Using prod environment"
+                        }
+                        else if (currentBranch =~ /^release\//) {
+                            ENVIRONMENT = 'stage'
+                            echo "ℹ Release branch detected → Using stage environment"
+                        }
+                        else {
+                            // Default to dev for feature/develop branches
+                            ENVIRONMENT = 'dev'
+                            echo "ℹ Feature/develop branch detected → Using dev environment"
+                        }
+                    }
+
                     echo "Environment: ${ENVIRONMENT}"
-                    echo "Image Tag: ${IMAGE_TAG ?: 'BUILD FROM SOURCE'}"
+                    echo "Image Tag: ${IMAGE_TAG ?: 'AUTO-GENERATE FROM BRANCH'}"
                     echo "Skip Build: ${SKIP_BUILD}"
                     echo "Skip Database: ${SKIP_DATABASE}"
                     echo "Run Bootstrap: ${RUN_BOOTSTRAP}"
+                    echo "Force Rollout: ${FORCE_ROLLOUT}"
                     echo "========================================="
 
+                    // VALIDATION: Check for common mistakes with manual IMAGE_TAG
+                    if (IMAGE_TAG && SKIP_BUILD) {
+                        // User manually specified a tag AND wants to skip build (reuse from ECR)
+                        echo ""
+                        echo "⚠️  IMPORTANT: Manual IMAGE_TAG with SKIP_BUILD=true"
+                        echo ""
+                        echo "You specified: IMAGE_TAG=${IMAGE_TAG}"
+                        echo "This will deploy EXISTING image from ECR with this exact tag"
+                        echo ""
+                        if (IMAGE_TAG.matches(/^\d+\.\d+\.\d+$/)) {
+                            // e.g., "1.2.0" without -rc or v prefix
+                            echo "❌ WARNING: Tag '${IMAGE_TAG}' looks incomplete!"
+                            echo ""
+                            echo "Common mistake patterns:"
+                            echo "  ❌ IMAGE_TAG=1.2.0 (will fail - doesn't exist in ECR)"
+                            echo "  ✅ IMAGE_TAG=1.2.0-rc42 (exists in ECR, from release branch)"
+                            echo "  ✅ IMAGE_TAG=v1.2.0 (rebuilt on main)"
+                            echo ""
+                            echo "Did you mean one of these?"
+                            echo "  - Rollback to RC: 1.2.0-rc42"
+                            echo "  - Deploy tagged release: v1.2.0"
+                            echo ""
+                            echo "If you meant '1.2.0', you probably want:"
+                            echo "  1. Check what's on stage-eks: kubectl get deployment frontend -n app -o jsonpath='{.spec.template.spec.containers[0].image}'"
+                            echo "  2. Extract full tag (e.g., 1.2.0-rc42)"
+                            echo "  3. Re-trigger with that exact tag"
+                        }
+                    }
+                    else if (IMAGE_TAG && !SKIP_BUILD) {
+                        // User specified tag but wants to build (will rebuild with this tag)
+                        echo ""
+                        echo "ℹ️  Manual IMAGE_TAG with SKIP_BUILD=false (default)"
+                        echo "Jenkins will REBUILD images with tag: ${IMAGE_TAG}"
+                        echo "This overwrites any existing ${IMAGE_TAG} images in ECR"
+                    }
+
                     if (!SKIP_BUILD && !IMAGE_TAG) {
-                        IMAGE_TAG = sh(
+                        // Get commit SHA for tagging
+                        def commitSHA = sh(
                             script: 'git rev-parse --short HEAD',
                             returnStdout: true
                         ).trim()
-                        echo "Generated image tag from commit SHA: ${IMAGE_TAG}"
+
+                        // Auto-generate tag based on branch
+                        if (currentBranch == 'main') {
+                            // Production: REQUIRE git tag - no fallback to commit SHA
+                            def gitTag = sh(
+                                script: 'git describe --tags --exact-match 2>/dev/null || echo ""',
+                                returnStdout: true
+                            ).trim()
+                            
+                            if (gitTag) {
+                                IMAGE_TAG = gitTag
+                                echo "✓ Production branch with semantic version: ${IMAGE_TAG}"
+                            } else {
+                                error("❌ PRODUCTION DEPLOYMENT REQUIRES A GIT TAG\n" +
+                                    "Current commit has no git tag.\n" +
+                                    "To deploy to production, create a semantic version tag:\n" +
+                                    "  git tag v1.2.3\n" +
+                                    "  git push origin v1.2.3\n" +
+                                    "Then trigger the pipeline again.")
+                            }
+                        } 
+                        else if (currentBranch =~ /^release\//) {
+                            // Release candidate: extract version from branch name
+                            // e.g., release/1.2.0 → 1.2.0-rc1
+                            def versionFromBranch = currentBranch.replaceAll(/^release\//, '')
+                            IMAGE_TAG = "${versionFromBranch}-rc${BUILD_NUMBER}"
+                            echo "✓ Release branch detected: ${IMAGE_TAG}"
+                        }
+                        else if (currentBranch =~ /^feature\//) {
+                            // Feature: use commit SHA
+                            IMAGE_TAG = commitSHA
+                            echo "✓ Feature branch detected: ${IMAGE_TAG}"
+                        }
+                        else if (currentBranch == 'develop') {
+                            // Development: use commit SHA
+                            IMAGE_TAG = commitSHA
+                            echo "✓ Develop branch detected: ${IMAGE_TAG}"
+                        }
+                        else {
+                            // Default: use commit SHA
+                            IMAGE_TAG = commitSHA
+                            echo "✓ Unknown branch (${currentBranch}), using commit SHA: ${IMAGE_TAG}"
+                        }
+                    }
+
+                    // FINAL VALIDATION: Only error if trying to skip build without specifying tag
+                    if (!IMAGE_TAG && SKIP_BUILD) {
+                        error("""
+❌ CRITICAL ERROR: Cannot skip build without specifying IMAGE_TAG
+
+You specified:
+  • IMAGE_TAG = (empty)
+  • SKIP_BUILD = true
+
+This is invalid because:
+  • SKIP_BUILD=true means "don't build, use existing images from ECR"
+  • But IMAGE_TAG is empty, so Jenkins doesn't know WHICH existing image to use
+  • Result: Deployment fails with no image to deploy
+
+SOLUTIONS:
+
+Option 1: Auto-generate (build fresh images)
+  • Set IMAGE_TAG = "" (EMPTY) ← already is
+  • Set SKIP_BUILD = false (uncheck the box)
+  • Jenkins will auto-generate tag from branch and build images
+
+Option 2: Reuse existing tested image
+  • Set IMAGE_TAG = exact-ecr-tag (e.g., 1.2.0-rc42 or v1.2.0)
+  • Set SKIP_BUILD = true
+  • Jenkins will use that existing image from ECR
+
+Most common use case:
+  • Just leave IMAGE_TAG empty and uncheck SKIP_BUILD
+  • Jenkins auto-generates from branch (fastest for normal deployments)
+""")
                     }
 
                     if (ENVIRONMENT == 'prod' && !RUN_BOOTSTRAP) {
@@ -254,6 +415,54 @@ pipeline {
                         echo "Gateway Address: $gateway_addr"
                         echo "Application Domain: $app_domain"
                     '''
+                }
+            }
+        }
+
+        stage('Deployment Summary') {
+            steps {
+                script {
+                    echo ""
+                    echo "========================================="
+                    echo "DEPLOYMENT COMPLETED SUCCESSFULLY"
+                    echo "========================================="
+                    echo ""
+                    echo "📋 DEPLOYMENT INFO"
+                    echo "   Environment: ${ENVIRONMENT}"
+                    echo "   Image Tag: ${IMAGE_TAG}"
+                    echo "   Build Number: ${BUILD_NUMBER}"
+                    echo "   Git Branch: $(sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim())"
+                    echo "   Git Commit: $(sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim())"
+                    echo ""
+                    echo "🔗 REFERENCE THIS DEPLOYMENT"
+                    echo "   To rollback to this build:"
+                    echo "   jenkins/Jenkinsfile build #${BUILD_NUMBER}: IMAGE_TAG=${IMAGE_TAG}"
+                    echo ""
+                    echo "   Manual trigger command:"
+                    echo "   ENVIRONMENT=${ENVIRONMENT} IMAGE_TAG=${IMAGE_TAG} SKIP_BUILD=true"
+                    echo ""
+                    echo "📁 ARTIFACTS LOCATION"
+                    echo "   Build metadata: deployment-artifacts/${BUILD_NUMBER}/metadata.txt"
+                    echo "   Deployed manifests: deployment-artifacts/${BUILD_NUMBER}/"
+                    echo ""
+                    echo "✅ Next Steps"
+                    if (ENVIRONMENT == 'stage') {
+                        echo "   This RC is now deployed to stage-eks for testing"
+                        echo "   To promote to production:"
+                        echo "   1. Test on stage-eks"
+                        echo "   2. If satisfied, create git tag: git tag v$(sh(script: 'echo $IMAGE_TAG | grep -oP \\'\\d+\\.\\d+\\.\\d+\\'', returnStdout: true).trim())"
+                        echo "   3. Push tag: git push origin --tags"
+                    }
+                    else if (ENVIRONMENT == 'dev') {
+                        echo "   This development build is deployed to dev-eks"
+                        echo "   For next iteration, push to feature branch again"
+                    }
+                    else if (ENVIRONMENT == 'prod') {
+                        echo "   Production deployment complete"
+                        echo "   VERSION ${IMAGE_TAG} is now live"
+                    }
+                    echo "========================================="
+                    echo ""
                 }
             }
         }
