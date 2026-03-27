@@ -1,0 +1,285 @@
+@Library('shared-pipeline-library') _
+
+/**
+ * JOB 1: Application CI Pipeline
+ * Repository: app-source-code (frontend, auth-service, game-service)
+ * 
+ * Responsibilities:
+ *   - Build Docker images
+ *   - Push to ECR
+ *   - Trigger Job 2 for deployment
+ * 
+ * Does NOT handle deployment logic
+ */
+
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'stage', 'prod'],
+            description: 'Target environment (auto-detected from branch for webhooks)'
+        )
+        booleanParam(
+            name: 'SKIP_BUILD',
+            defaultValue: false,
+            description: 'Skip image build (for manual deployments from existing images)'
+        )
+    }
+
+    environment {
+        AWS_REGION = 'us-east-1'
+        AWS_CREDENTIALS = credentials('aws-jenkins-credentials')
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        disableConcurrentBuilds()
+        timeout(time: 1, unit: 'HOURS')
+        timestamps()
+    }
+
+    triggers {
+        // Auto-trigger on feature/develop/main branch pushes
+        GenericTrigger(
+            genericVariables: [
+                [key: 'ref', value: '$.ref'],
+                [key: 'repository', value: '$.repository.name']
+            ],
+            causeString: 'Triggered by Git webhook',
+            token: 'app-ci-webhook',
+            printContributedVariables: true,
+            printPostContent: false,
+            silentOutput: false,
+            silentStartTrigger: false,
+            regexpFilterText: '$ref',
+            regexpFilterExpression: '^(refs/heads/develop|refs/heads/feature/.*|refs/heads/main)$',
+            genericRequestVariables: [],
+            genericHeaderVariables: []
+        )
+    }
+
+    stages {
+        stage('Initialize') {
+            steps {
+                script {
+                    echo "========================================="
+                    echo "Job 1: Application CI Pipeline"
+                    echo "========================================="
+                    
+                    // Auto-detect environment from branch
+                    def currentBranch = sh(
+                        script: 'git rev-parse --abbrev-ref HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    if (currentBranch == 'main') {
+                        ENVIRONMENT = 'prod'
+                        echo "ℹ Main branch → Production"
+                    }
+                    else if (currentBranch =~ /^release\//) {
+                        ENVIRONMENT = 'stage'
+                        echo "ℹ Release branch → Staging"
+                    }
+                    else {
+                        ENVIRONMENT = 'dev'
+                        echo "ℹ Feature/develop branch → Development"
+                    }
+
+                    echo "Environment: ${ENVIRONMENT}"
+                    echo "Skip Build: ${SKIP_BUILD}"
+                    echo "========================================="
+                }
+            }
+        }
+
+        stage('Checkout Source') {
+            when {
+                expression { !SKIP_BUILD }
+            }
+            steps {
+                script {
+                    echo "Checking out application source code..."
+                    checkout scm
+                }
+            }
+        }
+
+        stage('Build Images') {
+            when {
+                expression { !SKIP_BUILD }
+            }
+            steps {
+                script {
+                    echo "========================================="
+                    echo "Building Docker Images"
+                    echo "========================================="
+
+                    // Get commit SHA for image tagging
+                    def commitSHA = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    // Generate IMAGE_TAG based on branch
+                    def imageTag = commitSHA  // Default to SHA
+                    
+                    if (ENVIRONMENT == 'prod') {
+                        // Production requires semantic version tag
+                        def gitTag = sh(
+                            script: 'git describe --tags --always 2>/dev/null || echo "v0.0.0"',
+                            returnStdout: true
+                        ).trim()
+                        imageTag = gitTag
+                        echo "ℹ Production tag: ${imageTag}"
+                    }
+                    else if (ENVIRONMENT == 'stage') {
+                        // Stage uses RC incrementing
+                        def majorMinorPatch = sh(
+                            script: 'git describe --tags --match "v*" --abbrev=0 2>/dev/null | sed "s/v//" || echo "0.0.0"',
+                            returnStdout: true
+                        ).trim()
+                        imageTag = "${majorMinorPatch}-rc${BUILD_NUMBER}"
+                        echo "ℹ Stage RC tag: ${imageTag}"
+                    }
+                    else {
+                        // Dev uses commit SHA (already set)
+                        echo "ℹ Development SHA tag: ${imageTag}"
+                    }
+
+                    // Store for later use
+                    env.IMAGE_TAG = imageTag
+
+                    // Build images
+                    sh '''
+                        # Build frontend
+                        cd ${WORKSPACE}/frontend
+                        docker build -t ${ECR_REGISTRY}/frontend:${IMAGE_TAG} .
+                        docker tag ${ECR_REGISTRY}/frontend:${IMAGE_TAG} ${ECR_REGISTRY}/frontend:latest
+
+                        # Build auth service
+                        cd ${WORKSPACE}/auth-service
+                        docker build -t ${ECR_REGISTRY}/auth:${IMAGE_TAG} .
+                        docker tag ${ECR_REGISTRY}/auth:${IMAGE_TAG} ${ECR_REGISTRY}/auth:latest
+
+                        # Build game service
+                        cd ${WORKSPACE}/game-service
+                        docker build -t ${ECR_REGISTRY}/game:${IMAGE_TAG} .
+                        docker tag ${ECR_REGISTRY}/game:${IMAGE_TAG} ${ECR_REGISTRY}/game:latest
+
+                        echo "✓ All images built with tag: ${IMAGE_TAG}"
+                    '''
+                }
+            }
+        }
+
+        stage('Authenticate AWS') {
+            when {
+                expression { !SKIP_BUILD }
+            }
+            steps {
+                script {
+                    echo "Authenticating with AWS ECR..."
+                    sh '''
+                        aws configure set region ${AWS_REGION}
+                        aws sts get-caller-identity
+                    '''
+                }
+            }
+        }
+
+        stage('Push to ECR') {
+            when {
+                expression { !SKIP_BUILD }
+            }
+            steps {
+                script {
+                    echo "========================================="
+                    echo "Pushing Images to ECR"
+                    echo "========================================="
+                    sh '''
+                        # Login to ECR
+                        aws ecr get-login-password --region ${AWS_REGION} | \
+                        docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+                        # Push all services
+                        for service in frontend auth game; do
+                            echo "Pushing ${service}:${IMAGE_TAG}..."
+                            docker push ${ECR_REGISTRY}/${service}:${IMAGE_TAG}
+                            docker push ${ECR_REGISTRY}/${service}:latest
+                        done
+
+                        echo "✓ All images pushed to ECR"
+                    '''
+                }
+            }
+        }
+
+        stage('Build Summary') {
+            steps {
+                script {
+                    echo ""
+                    echo "========================================="
+                    echo "BUILD COMPLETED"
+                    echo "========================================="
+                    echo ""
+                    echo "📦 Build Info"
+                    echo "   Environment: ${ENVIRONMENT}"
+                    echo "   Image Tag: ${IMAGE_TAG}"
+                    echo "   Build Number: ${BUILD_NUMBER}"
+                    echo "   Git Commit: $(sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim())"
+                    echo "   Git Branch: $(sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim())"
+                    echo ""
+                    echo "🔗 Images in ECR"
+                    echo "   - ${ECR_REGISTRY}/frontend:${IMAGE_TAG}"
+                    echo "   - ${ECR_REGISTRY}/auth:${IMAGE_TAG}"
+                    echo "   - ${ECR_REGISTRY}/game:${IMAGE_TAG}"
+                    echo ""
+                    echo "➡️  Next Step: Triggering Job 2 (Deployment Pipeline)"
+                    echo "========================================="
+                    echo ""
+                }
+            }
+        }
+
+        stage('Trigger Deployment') {
+            steps {
+                script {
+                    echo "Triggering Job 2: kubernetes-infrastructure-deploy..."
+                    
+                    // Invoke Job 2 with parameters
+                    build job: 'kubernetes-infrastructure-deploy',
+                          parameters: [
+                              string(name: 'IMAGE_TAG', value: "${IMAGE_TAG}"),
+                              string(name: 'ENVIRONMENT', value: "${ENVIRONMENT}")
+                          ],
+                          wait: true,
+                          propagate: false  // Don't fail Job 1 if Job 2 fails
+                    
+                    echo "✓ Job 2 invocation complete"
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Job 1 (CI Pipeline) execution completed"
+            cleanWs(deleteDirs: true, patterns: [[pattern: '**/tmp/**', type: 'INCLUDE']])
+        }
+
+        success {
+            echo "========================================="
+            echo "✓ JOB 1 SUCCESSFUL"
+            echo "========================================="
+        }
+
+        failure {
+            echo "========================================="
+            echo "✗ JOB 1 FAILED"
+            echo "========================================="
+        }
+    }
+}

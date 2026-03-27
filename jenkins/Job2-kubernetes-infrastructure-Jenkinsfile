@@ -1,0 +1,302 @@
+@Library('shared-pipeline-library') _
+
+/**
+ * JOB 2: Application CD Pipeline
+ * Repository: kubernetes-infrastructure (manifests, ansible, etc.)
+ * 
+ * Responsibilities:
+ *   - Deploy applications to K8s clusters
+ *   - Apply Ansible playbooks
+ *   - Verify deployments
+ * 
+ * Does NOT build or push images
+ * 
+ * Triggers:
+ *   1. Webhook on manifest/ansible changes → trigger deployment
+ *   2. Programmatic call from Job 1 → with IMAGE_TAG from build
+ */
+
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'IMAGE_TAG',
+            defaultValue: '',
+            description: '''Image tag to deploy (passed from Job 1).
+            Leave EMPTY if triggering manually without new build.'''
+        )
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'stage', 'prod'],
+            description: 'Target deployment environment'
+        )
+        booleanParam(
+            name: 'SKIP_DATABASE',
+            defaultValue: true,
+            description: 'Skip database deployment'
+        )
+        booleanParam(
+            name: 'RUN_BOOTSTRAP',
+            defaultValue: false,
+            description: 'Run cluster bootstrap (use with caution)'
+        )
+        booleanParam(
+            name: 'FORCE_ROLLOUT',
+            defaultValue: false,
+            description: 'Force pod restart for config changes'
+        )
+    }
+
+    environment {
+        AWS_REGION = 'us-east-1'
+        AWS_CREDENTIALS = credentials('aws-jenkins-credentials')
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ANSIBLE_INVENTORY = "${WORKSPACE}/ansible/inventory.ini"
+        MANIFESTS_DIR = "${WORKSPACE}/manifests"
+        KUBECONFIG = credentials('kubeconfig-${ENVIRONMENT}')
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        disableConcurrentBuilds()
+        timeout(time: 1, unit: 'HOURS')
+        timestamps()
+    }
+
+    triggers {
+        // Trigger 1: Manifest/Ansible changes detected
+        GenericTrigger(
+            genericVariables: [
+                [key: 'ref', value: '$.ref'],
+                [key: 'repository', value: '$.repository.name']
+            ],
+            causeString: 'Triggered by infrastructure changes webhook',
+            token: 'k8s-infra-webhook',
+            printContributedVariables: true,
+            printPostContent: false,
+            silentOutput: false,
+            silentStartTrigger: false,
+            regexpFilterText: '$ref',
+            regexpFilterExpression: '^(refs/heads/release/.*|refs/heads/main)$',
+            genericRequestVariables: [],
+            genericHeaderVariables: []
+        )
+        // Trigger 2: Programmatic calls from Job 1 happen via 'build job:' parameter passing
+    }
+
+    stages {
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    echo "========================================="
+                    echo "Job 2: Application CD Pipeline"
+                    echo "========================================="
+                    
+                    // Auto-detect environment from branch if not specified
+                    def currentBranch = sh(
+                        script: 'git rev-parse --abbrev-ref HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    if (!params.ENVIRONMENT || params.ENVIRONMENT == 'dev') {
+                        if (currentBranch == 'main') {
+                            ENVIRONMENT = 'prod'
+                            echo "ℹ Main branch → Production"
+                        }
+                        else if (currentBranch =~ /^release\//) {
+                            ENVIRONMENT = 'stage'
+                            echo "ℹ Release branch → Staging"
+                        }
+                        else {
+                            ENVIRONMENT = 'dev'
+                            echo "ℹ Feature/develop → Development"
+                        }
+                    }
+
+                    echo "Environment: ${ENVIRONMENT}"
+                    echo "Image Tag: ${IMAGE_TAG ?: 'FROM ECR (latest deployed)'}"
+                    echo "Skip Database: ${SKIP_DATABASE}"
+                    echo "Run Bootstrap: ${RUN_BOOTSTRAP}"
+                    echo "Force Rollout: ${FORCE_ROLLOUT}"
+                    echo "========================================="
+                    
+                    // If IMAGE_TAG not provided, get latest from ECR
+                    if (!IMAGE_TAG) {
+                        echo ""
+                        echo "ℹ IMAGE_TAG not provided (likely manifest-only change)"
+                        echo "Using latest deployed version for environment: ${ENVIRONMENT}"
+                        echo ""
+                        
+                        // Query ECR for latest image tag
+                        sh '''
+                            # Get latest frontend image tag from ECR
+                            LATEST_TAG=$(aws ecr describe-images \
+                                --repository-name frontend \
+                                --region ${AWS_REGION} \
+                                --query 'sort_by(imageDetails, &imagePushedAt)[-1].imageTags[0]' \
+                                --output text 2>/dev/null || echo "latest")
+                            
+                            echo "Latest frontend image in ECR: ${LATEST_TAG}"
+                            export IMAGE_TAG=${LATEST_TAG}
+                        '''
+                    }
+
+                    if (ENVIRONMENT == 'prod' && !RUN_BOOTSTRAP) {
+                        input(message: '🔴 PRODUCTION DEPLOYMENT - Approve?', ok: 'Deploy to Production')
+                    }
+                }
+            }
+        }
+
+        stage('Checkout Infrastructure') {
+            steps {
+                script {
+                    echo "Checking out Kubernetes infrastructure..."
+                    checkout scm
+                }
+            }
+        }
+
+        stage('Authenticate AWS') {
+            steps {
+                script {
+                    echo "Authenticating with AWS..."
+                    sh '''
+                        aws configure set region ${AWS_REGION}
+                        aws sts get-caller-identity
+                    '''
+                }
+            }
+        }
+
+        stage('Run Bootstrap Pipeline') {
+            when {
+                expression { RUN_BOOTSTRAP }
+            }
+            steps {
+                script {
+                    echo "========================================="
+                    echo "Running Cluster Bootstrap"
+                    echo "========================================="
+                    sh '''
+                        cd ${WORKSPACE}
+                        ansible-playbook -i ${ANSIBLE_INVENTORY} ansible/bootstrap-deploy.yml \
+                            -e "env_name=${ENVIRONMENT}" \
+                            -e "frontend_image_tag=${IMAGE_TAG}" \
+                            -e "auth_image_tag=${IMAGE_TAG}" \
+                            -e "game_image_tag=${IMAGE_TAG}" \
+                            -v
+                    '''
+                }
+            }
+        }
+
+        stage('Run Application Deployment') {
+            steps {
+                script {
+                    echo "========================================="
+                    echo "Running Application Deployment"
+                    echo "========================================="
+                    sh '''
+                        cd ${WORKSPACE}
+                        ansible-playbook -i ${ANSIBLE_INVENTORY} ansible/app-deploy.yml \
+                            -e "env_name=${ENVIRONMENT}" \
+                            -e "frontend_image_tag=${IMAGE_TAG}" \
+                            -e "auth_image_tag=${IMAGE_TAG}" \
+                            -e "game_image_tag=${IMAGE_TAG}" \
+                            -e "force_rollout=${FORCE_ROLLOUT}" \
+                            --skip-tags="database" \
+                            -v
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                script {
+                    echo "========================================="
+                    echo "Verifying Deployment"
+                    echo "========================================="
+                    sh '''
+                        source ansible/group_vars/${ENVIRONMENT}.yml
+                        
+                        # Verify all deployments are ready
+                        echo "Checking deployment readiness..."
+                        for deployment in auth game frontend; do
+                            status=$(kubectl get deployment $deployment -n $k8s_namespace -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null)
+                            if [ "$status" = "True" ]; then
+                                echo "✓ $deployment deployment is ready"
+                            else
+                                echo "✗ $deployment deployment is NOT ready"
+                                exit 1
+                            fi
+                        done
+
+                        # Get gateway address
+                        echo ""
+                        echo "Gateway information:"
+                        gateway_addr=$(kubectl get gateway -n $k8s_namespace -o jsonpath='{.items[0].status.addresses[0].value}' 2>/dev/null || echo "pending")
+                        echo "  Address: $gateway_addr"
+                    '''
+                }
+            }
+        }
+
+        stage('Deployment Summary') {
+            steps {
+                script {
+                    echo ""
+                    echo "========================================="
+                    echo "DEPLOYMENT COMPLETED SUCCESSFULLY"
+                    echo "========================================="
+                    echo ""
+                    echo "📋 Deployment Details"
+                    echo "   Environment: ${ENVIRONMENT}"
+                    echo "   Image Tag: ${IMAGE_TAG}"
+                    echo "   Build Number: ${BUILD_NUMBER}"
+                    echo "   Git Branch: $(sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim())"
+                    echo "   Git Commit: $(sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim())"
+                    echo ""
+                    echo "🔗 Deployed To"
+                    if (ENVIRONMENT == 'dev') {
+                        echo "   Cluster: dev-eks"
+                        echo "   Namespace: app"
+                    } else if (ENVIRONMENT == 'stage') {
+                        echo "   Cluster: stage-eks"
+                        echo "   Namespace: app"
+                    } else {
+                        echo "   Cluster: prod-eks"
+                        echo "   Namespace: app"
+                    }
+                    echo ""
+                    echo "📝 Reference for Rollback"
+                    echo "   To rollback to this deployment:"
+                    echo "   Job 2 #${BUILD_NUMBER} → IMAGE_TAG=${IMAGE_TAG}"
+                    echo "========================================="
+                    echo ""
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Job 2 (CD Pipeline) execution completed"
+            cleanWs(deleteDirs: true, patterns: [[pattern: '**/tmp/**', type: 'INCLUDE']])
+        }
+
+        success {
+            echo "========================================="
+            echo "✓ JOB 2 SUCCESSFUL"
+            echo "========================================="
+        }
+
+        failure {
+            echo "========================================="
+            echo "✗ JOB 2 FAILED"
+            echo "========================================="
+        }
+    }
+}
